@@ -1,280 +1,243 @@
-# C-Based Web Crawler
+# C-Based Web Crawler with SQLite Storage
 
-A comprehensive depth-first web crawler implemented in C with MySQL storage, anti-bot evasion, and URL parameter extraction.
+A comprehensive depth-first web crawler implemented in C with SQLite3 storage, anti-bot evasion, and URL parameter extraction.
 
 ## Features
 
-- **Multiple Seed Types**: Accepts domains, subdomains, IP addresses, and CIDR ranges
-- **Depth-First Traversal**: Uses stack-based DFS to explore sites deeply before backtracking
-- **Anti-Bot Evasion**:
-  - User-Agent rotation (8 different browser signatures)
-  - Cookie handling via libcurl's cookie engine
-  - Browser-like headers (Accept, Accept-Language, etc.)
-  - Request throttling (100ms delay between requests)
-- **HTML Parsing**: Extracts links, assets (images, scripts, stylesheets), and URL parameters using libxml2 XPath
-- **MySQL Storage**: Stores all crawled data with foreign key relationships
-- **Domain Filtering**: Blacklists major platforms (Google, YouTube, Instagram, etc.)
-- **CIDR Expansion**: Automatically expands IP ranges to individual hosts
-- **Static Linking Option**: Can compile to a single portable binary
+- **Seed Processing**: Accepts domains, subdomains, IP addresses, and CIDR ranges
+- **DNS Resolution**: Automatically resolves hostnames to IPs
+- **CIDR Expansion**: Converts CIDR notation (e.g., `192.168.1.0/24`) to individual IPs
+- **Depth-First Crawl**: Stack-based DFS traversal for deep site exploration
+- **HTTP Client**: libcurl-based with full HTTP support
+- **Cookie Handling**: Automatic cookie management like a real browser
+- **User-Agent Rotation**: 8 realistic browser UAs rotated randomly
+- **HTML Parsing**: libxml2-based parser with XPath queries
+- **Link Extraction**: Finds all `<a href>` links from HTML pages
+- **Asset Discovery**: Extracts images, scripts, stylesheets
+- **Parameter Extraction**: Parses URL query parameters
+- **SQLite3 Storage**: Embedded database - no server required!
+- **Domain Filtering**: Blacklists major platforms (Google, YouTube, etc.)
+- **Configurable Depth**: Set maximum crawl depth
+- **Rate Limiting**: Built-in request throttling
 
-## Requirements
+## Prerequisites
 
-### Build Dependencies
-
-**Debian/Ubuntu:**
+### Debian/Ubuntu
 ```bash
-sudo apt-get install libcurl4-openssl-dev libxml2-dev libmysqlclient-dev build-essential
+sudo apt-get install libcurl4-openssl-dev libxml2-dev libsqlite3-dev build-essential
 ```
 
-**RHEL/CentOS/Fedora:**
+### RHEL/CentOS/Fedora
 ```bash
-sudo dnf install libcurl-devel libxml2-devel mysql-devel gcc make
+sudo dnf install libcurl-devel libxml2-devel sqlite3-devel gcc make
 ```
 
-**Alpine Linux:**
+### Alpine Linux
 ```bash
-apk add curl-dev libxml2-dev mysql-dev gcc make musl-dev
+apk add curl-dev libxml2-dev sqlite-dev gcc make musl-dev
 ```
-
-### Runtime Dependencies
-
-- MySQL server (for database storage)
-- Network access to target websites
 
 ## Installation
 
-### 1. Clone or Download
+1. Clone or download the source files:
+   ```bash
+   git clone <repository-url>
+   cd web-crawler
+   ```
 
-```bash
-cd /workspace
-```
+2. Compile the crawler:
+   ```bash
+   make
+   ```
 
-### 2. Build
-
-**Dynamic linking (standard):**
-```bash
-make
-```
-
-**Static linking (portable binary):**
-```bash
-make static
-```
-
-### 3. Setup Database
-
-```bash
-# Create database and tables
-mysql -u root -p < schema.sql
-```
-
-Or manually:
-```sql
-CREATE DATABASE web_crawler;
-USE web_crawler;
--- Tables are auto-created by the crawler on first run
-```
+3. (Optional) Build static binary for portability:
+   ```bash
+   make static
+   ```
 
 ## Usage
 
 ### Basic Usage
-
 ```bash
-# Crawl a single domain
 ./crawler example.com
-
-# Crawl multiple seeds
-./crawler example.com api.example.com
-
-# Crawl with CIDR range
-./crawler 192.168.1.0/24
-
-# Set maximum depth
-./crawler -d 5 example.com
-
-# Quiet mode
-./crawler -q example.com
 ```
 
-### Command Line Options
+### Multiple Seeds
+```bash
+./crawler example.com api.example.com
+```
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-d <depth>` | Maximum crawl depth | 10 |
-| `-q` | Quiet mode (less output) | verbose |
-| `-h` | Show help message | - |
+### With Custom Depth
+```bash
+./crawler -d 5 example.com
+```
 
-### Seed Formats
+### CIDR Range
+```bash
+./crawler 192.168.1.0/24
+```
 
-- **Domain**: `example.com`
-- **Subdomain**: `api.example.com`
-- **IP Address**: `192.168.1.1`
-- **CIDR Range**: `192.168.1.0/24`
-- **Full URL**: `http://example.com/path`
+### Help
+```bash
+./crawler -h
+```
+
+## Output
+
+The crawler creates a SQLite database file `crawler.db` in the current directory with three tables:
+
+### Tables
+
+**pages** - Stores crawled page information
+- `id`: Primary key
+- `host`: Domain or IP address
+- `path`: URL path
+- `query`: Query string
+- `full_url`: Complete URL
+- `status_code`: HTTP response code
+- `content_length`: Response size
+- `content_type`: Content-Type header
+- `crawled_at`: Timestamp
+
+**url_params** - Extracted URL parameters
+- `id`: Primary key
+- `page_id`: Foreign key to pages
+- `param_name`: Parameter name
+- `param_value`: Parameter value
+
+**assets** - Discovered assets
+- `id`: Primary key
+- `page_id`: Foreign key to pages
+- `asset_url`: Asset URL
+- `asset_type`: Type (image, script, stylesheet)
+
+### Query Examples
+
+View all crawled pages:
+```bash
+sqlite3 crawler.db "SELECT id, host, path, status_code FROM pages;"
+```
+
+Find all unique parameter names:
+```bash
+sqlite3 crawler.db "SELECT DISTINCT param_name FROM url_params;"
+```
+
+Count pages by status code:
+```bash
+sqlite3 crawler.db "SELECT status_code, COUNT(*) FROM pages GROUP BY status_code;"
+```
+
+List all discovered assets:
+```bash
+sqlite3 crawler.db "SELECT asset_type, COUNT(*) FROM assets GROUP BY asset_type;"
+```
 
 ## Database Schema
 
-The crawler creates three main tables:
-
-### `pages`
-Stores crawled page information:
-- `id`: Primary key
-- `host`: Domain or IP
-- `path`: URL path
-- `query`: Query string
-- `status_code`: HTTP response code
-- `content_length`: Response size
-- `content_type`: MIME type
-- `crawled_at`: Timestamp
-
-### `url_params`
-Stores extracted URL parameters:
-- `page_id`: Foreign key to pages
-- `param_name`: Parameter name
-- `param_value`: Parameter value (URL decoded)
-
-### `assets`
-Stores discovered assets:
-- `page_id`: Foreign key to pages
-- `asset_url`: Asset URL
-- `asset_type`: image/script/stylesheet
-
-## Example Queries
-
-```sql
--- Get summary per host
-SELECT * FROM v_host_summary;
-
--- Find all unique parameters
-SELECT * FROM v_unique_params;
-
--- Find pages with specific parameter
-SELECT p.* FROM pages p 
-JOIN url_params up ON p.id = up.page_id 
-WHERE up.param_name = 'id';
-
--- Find forbidden pages
-SELECT * FROM pages WHERE status_code = 403;
-
--- Get asset distribution
-SELECT * FROM v_asset_distribution;
+Initialize the database manually (optional - auto-created on first run):
+```bash
+sqlite3 crawler.db < schema.sql
 ```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    Crawler Main                      │
-├─────────────────────────────────────────────────────┤
-│  Seed Processor  →  Stack (DFS)  →  URL Processor   │
-│       ↓                                              │
-│  CIDR Expander                                       │
-│  DNS Resolver                                        │
-└─────────────────────────────────────────────────────┘
-                          ↓
-        ┌─────────────────┼─────────────────┐
-        ↓                 ↓                 ↓
-   ┌─────────┐     ┌──────────┐      ┌──────────┐
-   │ libcurl │     │ libxml2  │      │ MySQL    │
-   │ (HTTP)  │     │ (Parser) │      │ (Storage)│
-   └─────────┘     └──────────┘      └──────────┘
-        ↓                 ↓                 ↓
-   Fetch Pages      Extract Links     Store Results
-   Rotate UA        Extract Assets    
-   Handle Cookies   Extract Params    
+┌─────────────┐     ┌──────────────┐     ┌─────────────┐
+│   Seeds     │────▶│  URL Frontier│────▶│  libcurl    │
+│ (input)     │     │  (DFS Stack) │     │  (HTTP)     │
+└─────────────┘     └──────────────┘     └─────────────┘
+                           ▲                    │
+                           │                    ▼
+                    ┌──────────────┐     ┌─────────────┐
+                    │   Visited    │◀────│   Response  │
+                    │     Set      │     │   Buffer    │
+                    └──────────────┘     └─────────────┘
+                                                │
+                          ┌─────────────────────┼─────────────────────┐
+                          │                     │                     │
+                          ▼                     ▼                     ▼
+                   ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
+                   │  Link       │      │  Asset      │      │  Parameter  │
+                   │  Extractor  │      │  Extractor  │      │  Extractor  │
+                   │  (libxml2)  │      │             │      │             │
+                   └─────────────┘      └─────────────┘      └─────────────┘
+                          │                     │                     │
+                          └─────────────────────┼─────────────────────┘
+                                                │
+                                                ▼
+                                         ┌─────────────┐
+                                         │   SQLite3   │
+                                         │  Database   │
+                                         └─────────────┘
 ```
 
 ## Configuration
 
-Edit constants in `crawler.c`:
+Edit `crawler.c` to modify:
 
-```c
-#define MAX_DEPTH 10              // Maximum crawl depth
-#define REQUEST_DELAY_MS 100      // Delay between requests
-#define MAX_STACK_SIZE 50000      // Maximum URLs in stack
-#define MAX_VISITED 100000        // Maximum visited URLs
+- `MAX_DEPTH`: Maximum crawl depth (default: 10)
+- `MAX_URLS`: Maximum URLs to visit (default: 10000)
+- `REQUEST_DELAY_MS`: Delay between requests in ms (default: 100)
+- `DB_FILE`: SQLite database filename (default: "crawler.db")
+- `BLACKLISTED_DOMAINS`: Domains to skip
+- `USER_AGENTS`: User-Agent strings for rotation
 
-#define DB_HOST "localhost"
-#define DB_USER "crawler"
-#define DB_PASS "crawler_pass"
-#define DB_NAME "web_crawler"
-```
+## Building
 
-## Anti-Bot Features
-
-1. **User-Agent Rotation**: Randomly selects from 8 real browser signatures
-2. **Cookie Management**: Automatic cookie handling via libcurl
-3. **Header Spoofing**: Sends browser-like Accept and Accept-Language headers
-4. **Rate Limiting**: Configurable delay between requests
-5. **Domain Filtering**: Avoids blacklisted domains
-
-## Limitations
-
-- Does not execute JavaScript (libcurl limitation)
-- Single-threaded (can be extended with libcurl multi-interface)
-- No robots.txt compliance (add if needed for production)
-- Session-based challenges require manual cookie input
-
-## Compilation Flags
-
-For production builds, consider:
-
+### Dynamic Linking (Default)
 ```bash
-# Optimized build
-gcc -O3 -o crawler crawler.c -lcurl -lxml2 -lmysqlclient
-
-# Debug build
-gcc -g -DDEBUG -o crawler crawler.c -lcurl -lxml2 -lmysqlclient
-
-# Static portable build
-gcc -static -o crawler-static crawler.c -lcurl -lxml2 -lmysqlclient -lz -lssl -lcrypto
+make
+# or
+gcc -o crawler crawler.c -lcurl -lxml2 -lsqlite3 -lz -lssl -lcrypto
 ```
 
-## License
+### Static Linking (Portable Binary)
+```bash
+make static
+# or
+gcc -static -o crawler-static crawler.c -lcurl -lxml2 -lsqlite3 -lz -lssl -lcrypto
+```
 
-This project is provided as-is for educational and authorized testing purposes only.
-
-## Disclaimer
-
-**Important**: Only use this crawler on websites you own or have explicit permission to crawl. Unauthorized crawling may violate terms of service and laws.
+### Debug Build
+```bash
+gcc -g -DDEBUG -o crawler crawler.c -lcurl -lxml2 -lsqlite3 -lz -lssl -lcrypto
+```
 
 ## Troubleshooting
 
-### Build Errors
-
-**"mysql.h: No such file or directory"**
+### "sqlite3.h: No such file or directory"
+Install SQLite development package:
 ```bash
-# Install MySQL dev package
-sudo apt-get install libmysqlclient-dev
+sudo apt-get install libsqlite3-dev
 ```
 
-**"curl/curl.h: No such file or directory"**
-```bash
-# Install libcurl dev package
-sudo apt-get install libcurl4-openssl-dev
-```
+### "undefined reference to sqlite3_*"
+Ensure you're linking with `-lsqlite3`.
 
-### Runtime Errors
+### Crawler connects but finds no links
+- Check if the site uses JavaScript-heavy rendering (this crawler doesn't execute JS)
+- Verify the site allows crawling in robots.txt
+- Try increasing the depth limit
 
-**"MySQL connect failed"**
-```bash
-# Check MySQL is running
-sudo systemctl status mysql
+### Database locked errors
+SQLite supports concurrent reads but only one writer at a time. If running multiple crawlers, use different database files.
 
-# Verify credentials in crawler.c
-```
+## Legal Notice
 
-**"No seeds provided"**
-```bash
-# Provide at least one seed
-./crawler example.com
-```
+Use this tool responsibly and ethically:
+- Respect `robots.txt` files
+- Do not overload servers (rate limiting is built-in)
+- Only crawl sites you have permission to test
+- Comply with applicable laws and terms of service
 
-## Contributing
+## License
 
-Contributions welcome! Areas for improvement:
-- Multi-threaded crawling with libcurl multi-interface
-- Robots.txt compliance
-- JavaScript rendering (via headless browser integration)
-- Proxy support
-- Output formats (JSON, CSV export)
+MIT License - See LICENSE file for details.
+
+## Credits
+
+Built with:
+- [libcurl](https://curl.se/libcurl/) - HTTP client library
+- [libxml2](https://xmlsoft.org/) - HTML/XML parsing
+- [SQLite3](https://www.sqlite.org/) - Embedded database
