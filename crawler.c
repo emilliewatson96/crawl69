@@ -1069,6 +1069,7 @@ void db_create_tables(sqlite3 *conn) {
         "  page_id INTEGER NOT NULL,"
         "  param_name TEXT NOT NULL,"
         "  param_value TEXT,"
+        "  param_category TEXT,"
         "  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE"
         ")",
         
@@ -1397,6 +1398,9 @@ void crawler_run(Crawler *crawler) {
 
 /* Cleanup crawler resources */
 void crawler_cleanup(Crawler *crawler) {
+    /* Close output files */
+    close_output_files(crawler);
+
     /* Free stack */
     while (!stack_empty(crawler)) {
         URL url;
