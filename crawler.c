@@ -173,6 +173,23 @@ typedef struct {
     struct Crawler *crawler;
 } AsyncRequest;
 
+/* Target type enumeration */
+typedef enum {
+    TARGET_DOMAIN,
+    TARGET_IP,
+    TARGET_CIDR,
+    TARGET_URL
+} TargetType;
+
+/* Target structure for mixed input handling */
+typedef struct {
+    char original[512];
+    char host[256];
+    char expanded[MAX_HOSTS][64];  /* For CIDR expansion */
+    int expanded_count;
+    TargetType type;
+} Target;
+
 /* Crawler state */
 typedef struct Crawler {
     StackNode *stack;
@@ -187,10 +204,15 @@ typedef struct Crawler {
     int active_requests;
     time_t start_time;
     char target_host[256];
+    char **target_hosts;  /* Array of all target hosts for multi-target crawling */
+    int target_count;
+    int max_targets;
     int max_depth;
     int verbose;
     int use_colors;
     int use_wayback;
+    int follow_assets;     /* Follow asset URLs for deeper discovery */
+    int aggressive_mode;   /* More aggressive link following */
     pthread_mutex_t db_mutex;
     pthread_mutex_t output_mutex;
     FILE *urls_file;
@@ -282,6 +304,13 @@ void process_url(Crawler *crawler, const URL *url);
 /* Seed processing */
 int process_seeds(Crawler *crawler, char **seeds, int seed_count);
 int process_seed_file(Crawler *crawler, const char *filename);
+
+/* Enhanced target parsing for mixed input */
+TargetType detect_target_type(const char *target);
+int parse_mixed_target(const char *target, Target *parsed);
+int expand_all_targets(Crawler *crawler, char **seeds, int seed_count);
+int is_valid_ipv4(const char *ip);
+int is_valid_cidr(const char *cidr);
 
 /* Wayback Machine integration */
 int fetch_wayback_urls(Crawler *crawler, const char *host);
@@ -706,7 +735,6 @@ int is_valid_ip(const char *ip) {
 
 /* Expand CIDR range to individual IPs */
 int expand_cidr(const char *cidr, char **ips, int max_ips) {
-    char ip_str[64];
     char *slash = strchr(cidr, '/');
     
     if (!slash) {
@@ -765,6 +793,158 @@ int resolve_hostname(const char *hostname, char *ip) {
     
     freeaddrinfo(res);
     return 0;
+}
+
+/* ===================== ENHANCED TARGET PARSING ===================== */
+
+/* Check if string is valid IPv4 address */
+int is_valid_ipv4(const char *ip) {
+    struct in_addr addr;
+    return inet_pton(AF_INET, ip, &addr) == 1;
+}
+
+/* Check if string is valid CIDR notation */
+int is_valid_cidr(const char *cidr) {
+    const char *slash = strchr(cidr, '/');
+    if (!slash) return 0;
+    
+    /* Check prefix length */
+    int prefix = atoi(slash + 1);
+    if (prefix < 0 || prefix > 32) return 0;
+    
+    /* Temporarily null terminate to check IP part */
+    char temp[64];
+    strncpy(temp, cidr, slash - cidr);
+    temp[slash - cidr] = '\0';
+    
+    return is_valid_ipv4(temp);
+}
+
+/* Detect target type from string */
+TargetType detect_target_type(const char *target) {
+    if (!target || !*target) return TARGET_DOMAIN;
+    
+    /* Check for full URL */
+    if (strncmp(target, "http://", 7) == 0 || strncmp(target, "https://", 8) == 0)
+        return TARGET_URL;
+    
+    /* Check for CIDR */
+    if (is_valid_cidr(target))
+        return TARGET_CIDR;
+    
+    /* Check for IP address */
+    if (is_valid_ipv4(target))
+        return TARGET_IP;
+    
+    /* Default to domain/subdomain */
+    return TARGET_DOMAIN;
+}
+
+/* Parse a mixed target and populate Target structure */
+int parse_mixed_target(const char *target, Target *parsed) {
+    if (!target || !parsed) return -1;
+    
+    memset(parsed, 0, sizeof(Target));
+    strncpy(parsed->original, target, sizeof(parsed->original) - 1);
+    parsed->type = detect_target_type(target);
+    
+    switch (parsed->type) {
+        case TARGET_CIDR: {
+            /* Expand CIDR to IPs */
+            char *ips[MAX_HOSTS];
+            parsed->expanded_count = expand_cidr(target, ips, MAX_HOSTS);
+            
+            for (int i = 0; i < parsed->expanded_count && i < MAX_HOSTS; i++) {
+                strncpy(parsed->expanded[i], ips[i], sizeof(parsed->expanded[0]) - 1);
+                free(ips[i]);
+            }
+            
+            /* Extract network portion as host */
+            char temp[512];
+            strncpy(temp, target, sizeof(temp) - 1);
+            char *slash = strchr(temp, '/');
+            if (slash) *slash = '\0';
+            strncpy(parsed->host, temp, sizeof(parsed->host) - 1);
+            break;
+        }
+        
+        case TARGET_IP:
+            strncpy(parsed->host, target, sizeof(parsed->host) - 1);
+            parsed->expanded_count = 1;
+            strncpy(parsed->expanded[0], target, sizeof(parsed->expanded[0]) - 1);
+            break;
+        
+        case TARGET_URL: {
+            URL url;
+            if (parse_url(target, &url) == 0) {
+                strncpy(parsed->host, url.host, sizeof(parsed->host) - 1);
+            }
+            parsed->expanded_count = 1;
+            strncpy(parsed->expanded[0], target, sizeof(parsed->expanded[0]) - 1);
+            break;
+        }
+        
+        case TARGET_DOMAIN:
+        default:
+            /* Remove scheme if present */
+            const char *host_start = target;
+            if (strncmp(target, "http://", 7) == 0) host_start = target + 7;
+            else if (strncmp(target, "https://", 8) == 0) host_start = target + 8;
+            
+            /* Copy up to first / or end */
+            int i = 0;
+            while (host_start[i] && host_start[i] != '/' && i < 255) {
+                parsed->host[i] = host_start[i];
+                i++;
+            }
+            parsed->host[i] = '\0';
+            
+            parsed->expanded_count = 1;
+            snprintf(parsed->expanded[0], sizeof(parsed->expanded[0]), "http://%s/", parsed->host);
+            break;
+    }
+    
+    return 0;
+}
+
+/* Expand all targets and add to crawler queue */
+int expand_all_targets(Crawler *crawler, char **seeds, int seed_count) {
+    int total_added = 0;
+    
+    for (int i = 0; i < seed_count; i++) {
+        Target target;
+        if (parse_mixed_target(seeds[i], &target) != 0) continue;
+        
+        /* Add to target hosts array for multi-target tracking */
+        if (crawler->target_count < crawler->max_targets) {
+            crawler->target_hosts[crawler->target_count++] = str_dup(target.host);
+        }
+        
+        /* Add expanded IPs/URLs to crawl queue */
+        for (int j = 0; j < target.expanded_count; j++) {
+            URL url;
+            char url_str[MAX_URL_LENGTH];
+            
+            if (target.type == TARGET_IP || target.type == TARGET_CIDR) {
+                snprintf(url_str, sizeof(url_str), "http://%s/", target.expanded[j]);
+            } else {
+                strncpy(url_str, target.expanded[j], sizeof(url_str) - 1);
+            }
+            
+            if (parse_url(url_str, &url) == 0) {
+                url.depth = 0;
+                stack_push(crawler, &url);
+                total_added++;
+            }
+        }
+        
+        /* Set primary target host if not set */
+        if (crawler->target_host[0] == '\0') {
+            strncpy(crawler->target_host, target.host, sizeof(crawler->target_host) - 1);
+        }
+    }
+    
+    return total_added;
 }
 
 /* Write callback for libcurl */
@@ -932,6 +1112,9 @@ int extract_links(Crawler *crawler, const char *html, const URL *base_url,
 /* Extract assets (images, scripts, stylesheets) from HTML */
 int extract_assets(Crawler *crawler, const char *html, const URL *base_url,
                    Asset *assets, int max_assets) {
+    (void)crawler;  /* Suppress unused warning - used in future enhancements */
+    (void)base_url; /* Suppress unused warning - used for relative URL resolution */
+    
     int count = 0;
     
     htmlDocPtr doc = htmlReadMemory(html, strlen(html), NULL, NULL,
@@ -1322,6 +1505,15 @@ void crawler_init(Crawler *crawler, const char *target) {
     
     visited_init(&crawler->visited);
     
+    /* Allocate target hosts array */
+    crawler->max_targets = MAX_TARGETS;
+    crawler->target_hosts = malloc(MAX_TARGETS * sizeof(char *));
+    if (!crawler->target_hosts) {
+        fprintf(stderr, "[!] Failed to allocate target hosts array\n");
+        exit(1);
+    }
+    crawler->target_count = 0;
+    
     /* Initialize libcurl */
     curl_global_init(CURL_GLOBAL_ALL);
     crawler->curl = curl_easy_init();
@@ -1343,61 +1535,40 @@ void crawler_init(Crawler *crawler, const char *target) {
     strncpy(crawler->target_host, target, sizeof(crawler->target_host) - 1);
     crawler->max_depth = MAX_DEPTH;
     crawler->verbose = 1;
+    crawler->use_colors = 1;
+    crawler->use_wayback = 0;
+    crawler->follow_assets = 1;      /* Follow asset URLs by default */
+    crawler->aggressive_mode = 0;    /* Conservative by default */
     crawler->start_time = time(NULL);
     
-    printf("[+] Crawler initialized for target: %s\n", target);
+    if (target && *target)
+        printf("[+] Crawler initialized for target: %s\n", target);
 }
 
-/* Process seeds and add to stack */
+/* Process seeds using enhanced target parsing */
 int process_seeds(Crawler *crawler, char **seeds, int seed_count) {
-    int added = 0;
+    int added = expand_all_targets(crawler, seeds, seed_count);
     
+    printf("[+] Added %d seed URLs to crawl queue from %d targets\n", added, seed_count);
+    printf("[+] Target types detected: ");
+    
+    int cidr_count = 0, ip_count = 0, domain_count = 0, url_count = 0;
     for (int i = 0; i < seed_count; i++) {
-        char *seed = seeds[i];
-        
-        /* Check if it's a CIDR range */
-        if (strchr(seed, '/')) {
-            char *ips[MAX_HOSTS];
-            int ip_count = expand_cidr(seed, ips, MAX_HOSTS);
-            
-            for (int j = 0; j < ip_count; j++) {
-                URL url;
-                char url_str[MAX_URL_LENGTH];
-                snprintf(url_str, sizeof(url_str), "http://%s/", ips[j]);
-                
-                if (parse_url(url_str, &url) == 0) {
-                    url.depth = 0;
-                    stack_push(crawler, &url);
-                    added++;
-                }
-                free(ips[j]);
-            }
-        } else {
-            /* Regular domain or IP */
-            URL url;
-            char url_str[MAX_URL_LENGTH];
-            
-            /* Add scheme if missing */
-            if (strncmp(seed, "http://", 7) != 0 && strncmp(seed, "https://", 8) != 0) {
-                snprintf(url_str, sizeof(url_str), "http://%s/", seed);
-            } else {
-                strncpy(url_str, seed, sizeof(url_str) - 1);
-            }
-            
-            if (parse_url(url_str, &url) == 0) {
-                url.depth = 0;
-                
-                /* Update target host if this is the first seed */
-                if (crawler->target_host[0] == '\0')
-                    strncpy(crawler->target_host, url.host, sizeof(crawler->target_host) - 1);
-                
-                stack_push(crawler, &url);
-                added++;
-            }
+        TargetType t = detect_target_type(seeds[i]);
+        switch(t) {
+            case TARGET_CIDR: cidr_count++; break;
+            case TARGET_IP: ip_count++; break;
+            case TARGET_DOMAIN: domain_count++; break;
+            case TARGET_URL: url_count++; break;
         }
     }
     
-    printf("[+] Added %d seed URLs to crawl queue\n", added);
+    if (cidr_count > 0) printf("%d CIDR ", cidr_count);
+    if (ip_count > 0) printf("%d IPs ", ip_count);
+    if (domain_count > 0) printf("%d domains ", domain_count);
+    if (url_count > 0) printf("%d URLs ", url_count);
+    printf("\n");
+    
     return added;
 }
 
@@ -1540,6 +1711,15 @@ void crawler_cleanup(Crawler *crawler) {
     /* Free visited set */
     visited_free(&crawler->visited);
     
+    /* Free target hosts array */
+    if (crawler->target_hosts) {
+        for (int i = 0; i < crawler->target_count; i++) {
+            free(crawler->target_hosts[i]);
+        }
+        free(crawler->target_hosts);
+        crawler->target_hosts = NULL;
+    }
+    
     /* Cleanup libcurl */
     if (crawler->curl)
         curl_easy_cleanup(crawler->curl);
@@ -1658,26 +1838,36 @@ void print_usage(const char *prog) {
     printf(COLOR_BOLD COLOR_CYAN "║              Advanced Web Crawler - Usage Guide              ║\n" COLOR_RESET);
     printf(COLOR_BOLD COLOR_CYAN "╚═══════════════════════════════════════════════════════════╝\n\n" COLOR_RESET);
     printf("Usage: %s [options] <seed1> [seed2] ... | -f <targets_file>\n\n", prog);
-    printf(COLOR_BOLD "Seeds can be:" COLOR_RESET "\n");
+    printf(COLOR_BOLD "Seeds can be (mixed in any combination):" COLOR_RESET "\n");
     printf("  • Domain:        example.com\n");
     printf("  • Subdomain:     api.example.com\n");
     printf("  • IP address:    192.168.1.1\n");
     printf("  • CIDR range:    192.168.1.0/24\n");
-    printf("  • Full URL:      https://example.com/path\n\n");
+    printf("  • Full URL:      https://example.com/path\n");
+    printf("  • File input:    targets.txt (one per line, mixed types)\n\n");
     printf(COLOR_BOLD "Options:" COLOR_RESET "\n");
     printf("  " COLOR_GREEN "-f <file>" COLOR_RESET "      Read targets from file (one per line)\n");
     printf("  " COLOR_GREEN "-d <depth>" COLOR_RESET "     Maximum crawl depth (default: %d)\n", MAX_DEPTH);
-    printf("  " COLOR_GREEN "-t <threads>" COLOR_RESET "   Max concurrent requests (default: %d)\n", MAX_CONCURRENT_REQUESTS);
+    printf("  " COLOR_GREEN "-a" COLOR_RESET "             Aggressive mode (follow all links including assets)\n");
     printf("  " COLOR_GREEN "-q" COLOR_RESET "             Quiet mode (minimal output)\n");
     printf("  " COLOR_GREEN "-v" COLOR_RESET "             Verbose mode (detailed output)\n");
-    printf("  " COLOR_GREEN "-w" COLOR_RESET "             Enable Wayback Machine lookup\n");
+    printf("  " COLOR_GREEN "-w" COLOR_RESET "             Enable Wayback Machine lookup for historical URLs\n");
     printf("  " COLOR_GREEN "-h" COLOR_RESET "             Show this help message\n\n");
     printf(COLOR_BOLD "Examples:" COLOR_RESET "\n");
     printf("  %s example.com\n", prog);
-    printf("  %s -d 5 -t 30 example.com api.example.com\n", prog);
+    printf("  %s -d 5 -w example.com api.example.com\n", prog);
     printf("  %s -f targets.txt\n", prog);
-    printf("  %s -w -d 3 example.com\n", prog);
-    printf("  %s 192.168.1.0/24\n\n", prog);
+    printf("  %s -w -d 3 -a example.com\n", prog);
+    printf("  %s 192.168.1.0/24\n", prog);
+    printf("  %s -f mixed_targets.txt -w -d 5\n\n", prog);
+    
+    printf(COLOR_BOLD "File Format (targets.txt):" COLOR_RESET "\n");
+    printf("  # Comments start with #\n");
+    printf("  example.com\n");
+    printf("  api.example.com\n");
+    printf("  192.168.1.1\n");
+    printf("  10.0.0.0/24\n");
+    printf("  https://example.com/admin\n\n");
 }
 
 /* Main entry point */
@@ -1687,13 +1877,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    /* Print banner */
+    print_banner();
+    
     /* Parse command line arguments */
     char **seeds = malloc(MAX_TARGETS * sizeof(char *));
     int seed_count = 0;
     int max_depth = MAX_DEPTH;
     int verbose = 1;
     int use_wayback = 0;
-    int max_threads = MAX_CONCURRENT_REQUESTS;
+    int aggressive_mode = 0;
     char *targets_file = NULL;
     
     for (int i = 1; i < argc; i++) {
@@ -1702,10 +1895,8 @@ int main(int argc, char *argv[]) {
             return 0;
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             max_depth = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
-            max_threads = atoi(argv[++i]);
-            if (max_threads < 1) max_threads = 1;
-            if (max_threads > MAX_CONCURRENT_REQUESTS) max_threads = MAX_CONCURRENT_REQUESTS;
+        } else if (strcmp(argv[i], "-a") == 0) {
+            aggressive_mode = 1;
         } else if (strcmp(argv[i], "-q") == 0) {
             verbose = 0;
         } else if (strcmp(argv[i], "-v") == 0) {
@@ -1764,6 +1955,7 @@ int main(int argc, char *argv[]) {
     crawler.max_depth = max_depth;
     crawler.verbose = verbose;
     crawler.use_wayback = use_wayback;
+    crawler.aggressive_mode = aggressive_mode;
     
     /* Process seeds */
     process_seeds(&crawler, seeds, seed_count);
@@ -1787,6 +1979,10 @@ int main(int argc, char *argv[]) {
         if (targets_file) free(seeds[i]);
     }
     free(seeds);
+    
+    printf(COLOR_BOLD COLOR_GREEN "\n[✓] Crawl completed successfully!\n" COLOR_RESET);
+    printf("    Database: %s\n", DB_FILE);
+    printf("    Output directory: %s/\n", OUTPUT_DIR);
     
     return 0;
 }

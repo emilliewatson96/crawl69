@@ -1,0 +1,2 @@
+http://httpbin.org/ | Status: 200 | Size: 9593 | Type: unknown | Host: httpbin.org
+http://example.com/ | Status: 200 | Size: -1 | Type: unknown | Host: example.com

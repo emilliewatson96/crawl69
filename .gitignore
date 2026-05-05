@@ -1,10 +1,4 @@
-```
-# Database files
-*.db
-
-# Output directories
-output/
-
-# Executable
-crawler
+```c
+crawler.c
+test_targets.txt
 ```
