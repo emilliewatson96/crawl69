@@ -2,16 +2,19 @@
  * C-Based Web Crawler with Depth-First Traversal
  * 
  * Features:
- * - Seed input: domains, subdomains, IPs, CIDR ranges
+ * - Seed input: domains, subdomains, IPs, CIDR ranges, or file with targets
  * - DNS resolution and URL construction
  * - Depth-first crawl strategy with stack-based traversal
+ * - Asynchronous HTTP fetching using libcurl multi interface
  * - HTTP client using libcurl with cookie support
  * - User-Agent rotation for anti-bot evasion
  * - HTML parsing with libxml2 for link/asset extraction
- * - URL parameter extraction
- * - MySQL storage for crawled data
+ * - URL parameter extraction with categorization
+ * - Wayback Machine integration for historical URLs
+ * - SQLite3 storage for crawled data
  * - External domain filtering (Google, YouTube, etc.)
- * - Static linking for portability
+ * - Plain text export of results
+ * - Colorized CLI output
  *
  * Compile: gcc -o crawler crawler.c -lcurl -lxml2 -lsqlite3 -lz -lssl -lcrypto
  */
@@ -22,10 +25,12 @@
 #include <ctype.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdarg.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <pthread.h>
 
 /* libcurl headers */
 #include <curl/curl.h>
@@ -47,12 +52,35 @@
 #define MAX_STACK_SIZE 50000
 #define MAX_PARAMS_PER_URL 100
 #define MAX_ASSETS_PER_PAGE 500
-#define REQUEST_DELAY_MS 100
+#define REQUEST_DELAY_MS 50
 #define MAX_DEPTH 10
 #define MAX_LINKS_PER_PAGE 1000
+#define MAX_CONCURRENT_REQUESTS 20
+#define WAYBACK_BATCH_SIZE 1000
 
 /* Database configuration */
 #define DB_FILE "crawler.db"
+#define OUTPUT_DIR "output"
+
+/* ANSI Color codes for CLI */
+#define COLOR_RESET   "\033[0m"
+#define COLOR_RED     "\033[31m"
+#define COLOR_GREEN   "\033[32m"
+#define COLOR_YELLOW  "\033[33m"
+#define COLOR_BLUE    "\033[34m"
+#define COLOR_MAGENTA "\033[35m"
+#define COLOR_CYAN    "\033[36m"
+#define COLOR_WHITE   "\033[37m"
+#define COLOR_BOLD    "\033[1m"
+
+/* Parameter categories */
+typedef enum {
+    PARAM_SENSITIVE,
+    PARAM_NAVIGATION,
+    PARAM_SEARCH,
+    PARAM_STANDARD,
+    PARAM_UNKNOWN
+} ParamCategory;
 
 /* Blacklisted domains to ignore */
 const char *BLACKLISTED_DOMAINS[] = {
@@ -92,6 +120,7 @@ typedef struct {
 typedef struct {
     char name[256];
     char value[512];
+    ParamCategory category;
 } URLParam;
 
 /* Asset structure */
@@ -119,20 +148,39 @@ typedef struct {
     int count;
 } VisitedSet;
 
+/* Async request context for multi interface */
+typedef struct {
+    CURL *easy;
+    URL url;
+    ResponseBuffer response;
+    long status_code;
+    long content_length;
+    char *content_type;
+    sqlite3_int64 page_id;
+    Crawler *crawler;
+} AsyncRequest;
+
 /* Crawler state */
 typedef struct {
     StackNode *stack;
     int stack_size;
     VisitedSet visited;
-    CURL *curl;
+    CURLM *multi;  /* Multi handle for async requests */
     sqlite3 *db_conn;
     int total_pages;
     int total_params;
     int total_assets;
+    int active_requests;
     time_t start_time;
     char target_host[256];
     int max_depth;
     int verbose;
+    int use_colors;
+    pthread_mutex_t db_mutex;
+    pthread_mutex_t output_mutex;
+    FILE *urls_file;
+    FILE *params_file;
+    FILE *assets_file;
 } Crawler;
 
 /* Response buffer for libcurl */
@@ -180,10 +228,25 @@ int extract_parameters(const char *query, URLParam *params, int max_params);
 /* Database operations */
 int db_connect(Crawler *crawler);
 int db_insert_page(Crawler *crawler, const URL *url, long status_code, 
-                   long content_length, const char *content_type);
+                   long content_length, const char *content_type, sqlite3_int64 *page_id);
 int db_insert_param(Crawler *crawler, sqlite3_int64 page_id, const URLParam *param);
 int db_insert_asset(Crawler *crawler, sqlite3_int64 page_id, const Asset *asset);
 void db_create_tables(sqlite3 *conn);
+
+/* Wayback Machine integration */
+int fetch_wayback_urls(Crawler *crawler, const char *host);
+
+/* File I/O for plain text export */
+int init_output_files(Crawler *crawler);
+void close_output_files(Crawler *crawler);
+void export_url_to_file(Crawler *crawler, const URL *url, long status_code, long content_length);
+void export_param_to_file(Crawler *crawler, const URLParam *param, const char *full_url);
+void export_asset_to_file(Crawler *crawler, const Asset *asset, const char *source_url);
+
+/* Async multi interface handlers */
+void async_request_init(Crawler *crawler);
+void async_fetch_url(Crawler *crawler, const URL *url);
+void async_process_completed(Crawler *crawler);
 
 /* Utility functions */
 char *get_random_user_agent(void);
@@ -191,6 +254,16 @@ void sleep_ms(int milliseconds);
 char *str_dup(const char *s);
 void url_decode(char *dst, const char *src);
 int hash_string(const char *str);
+ParamCategory categorize_parameter(const char *name);
+const char *param_category_name(ParamCategory cat);
+
+/* CLI output helpers */
+void print_banner(void);
+void print_status(Crawler *crawler, const char *format, ...);
+void print_success(const char *format, ...);
+void print_error(const char *format, ...);
+void print_info(const char *format, ...);
+void print_warning(const char *format, ...);
 
 /* Main crawler logic */
 void crawler_init(Crawler *crawler, const char *target);
@@ -200,6 +273,7 @@ void process_url(Crawler *crawler, const URL *url);
 
 /* Seed processing */
 int process_seeds(Crawler *crawler, char **seeds, int seed_count);
+int process_seed_file(Crawler *crawler, const char *filename);
 
 /* ===================== IMPLEMENTATION ===================== */
 
@@ -261,6 +335,140 @@ void visited_free(VisitedSet *set) {
         set->buckets[i] = NULL;
     }
     set->count = 0;
+}
+
+/* Categorize parameter based on name */
+ParamCategory categorize_parameter(const char *name) {
+    const char *sensitive_keywords[] = {
+        "pass", "password", "pwd", "secret", "token", "auth", "key", "api_key",
+        "apikey", "session", "sess", "cookie", "cred", "login", "user", "username",
+        "email", "phone", "ssn", "credit", "card", "cvv", "pin", NULL
+    };
+    
+    const char *navigation_keywords[] = {
+        "page", "p", "offset", "limit", "start", "end", "sort", "order", "dir",
+        "filter", "category", "cat", "section", "tab", "view", "mode", NULL
+    };
+    
+    const char *search_keywords[] = {
+        "q", "query", "search", "find", "lookup", "term", "keyword", "text",
+        "filter", "where", "like", NULL
+    };
+    
+    char name_lower[256];
+    strncpy(name_lower, name, sizeof(name_lower) - 1);
+    name_lower[sizeof(name_lower) - 1] = '\0';
+    
+    /* Convert to lowercase */
+    for (char *p = name_lower; *p; p++)
+        *p = tolower(*p);
+    
+    /* Check sensitive */
+    for (int i = 0; sensitive_keywords[i] != NULL; i++) {
+        if (strstr(name_lower, sensitive_keywords[i]) != NULL)
+            return PARAM_SENSITIVE;
+    }
+    
+    /* Check navigation */
+    for (int i = 0; navigation_keywords[i] != NULL; i++) {
+        if (strcmp(name_lower, navigation_keywords[i]) == 0 ||
+            strstr(name_lower, navigation_keywords[i]) != NULL)
+            return PARAM_NAVIGATION;
+    }
+    
+    /* Check search */
+    for (int i = 0; search_keywords[i] != NULL; i++) {
+        if (strcmp(name_lower, search_keywords[i]) == 0 ||
+            strstr(name_lower, search_keywords[i]) != NULL)
+            return PARAM_SEARCH;
+    }
+    
+    return PARAM_STANDARD;
+}
+
+/* Get parameter category name */
+const char *param_category_name(ParamCategory cat) {
+    switch (cat) {
+        case PARAM_SENSITIVE: return "SENSITIVE";
+        case PARAM_NAVIGATION: return "NAVIGATION";
+        case PARAM_SEARCH: return "SEARCH";
+        case PARAM_STANDARD: return "STANDARD";
+        default: return "UNKNOWN";
+    }
+}
+
+/* Print colorful banner */
+void print_banner(void) {
+    printf("\n");
+    printf(COLOR_BOLD COLOR_CYAN "╔═══════════════════════════════════════════════════════════╗\n" COLOR_RESET);
+    printf(COLOR_BOLD COLOR_CYAN "║         C-Based Web Crawler with DFS Traversal           ║\n" COLOR_RESET);
+    printf(COLOR_BOLD COLOR_CYAN "║       SQLite3 + Wayback Machine + Async Fetching         ║\n" COLOR_RESET);
+    printf(COLOR_BOLD COLOR_CYAN "╚═══════════════════════════════════════════════════════════╝\n" COLOR_RESET);
+    printf("\n");
+}
+
+/* Print status message with colors */
+void print_status(Crawler *crawler, const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    
+    if (crawler && crawler->use_colors)
+        printf(COLOR_BLUE "[*] " COLOR_RESET);
+    else
+        printf("[*] ");
+    
+    vprintf(format, args);
+    printf(COLOR_RESET "\n");
+    
+    va_end(args);
+}
+
+/* Print success message */
+void print_success(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    
+    printf(COLOR_GREEN "[+] " COLOR_RESET);
+    vprintf(format, args);
+    printf(COLOR_RESET "\n");
+    
+    va_end(args);
+}
+
+/* Print error message */
+void print_error(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    
+    fprintf(stderr, COLOR_RED "[!] " COLOR_RESET);
+    vfprintf(stderr, format, args);
+    fprintf(stderr, COLOR_RESET "\n");
+    
+    va_end(args);
+}
+
+/* Print info message */
+void print_info(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    
+    printf(COLOR_WHITE "[i] " COLOR_RESET);
+    vprintf(format, args);
+    printf(COLOR_RESET "\n");
+    
+    va_end(args);
+}
+
+/* Print warning message */
+void print_warning(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    
+    printf(COLOR_YELLOW "[!] " COLOR_RESET);
+    vprintf(format, args);
+    printf(COLOR_RESET "\n");
+    
+    va_end(args);
 }
 
 /* Stack push */
@@ -881,7 +1089,7 @@ void db_create_tables(sqlite3 *conn) {
 
 /* Insert page record into database */
 int db_insert_page(Crawler *crawler, const URL *url, long status_code,
-                   long content_length, const char *content_type) {
+                   long content_length, const char *content_type, sqlite3_int64 *page_id) {
     if (!crawler->db_conn)
         return -1;
     
@@ -892,8 +1100,11 @@ int db_insert_page(Crawler *crawler, const URL *url, long status_code,
     const char *sql = "INSERT INTO pages (host, path, query, full_url, status_code, content_length, content_type) "
                       "VALUES (?, ?, ?, ?, ?, ?, ?)";
     
+    pthread_mutex_lock(&crawler->db_mutex);
+    
     if (sqlite3_prepare_v2(crawler->db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
         fprintf(stderr, "[!] DB prepare failed: %s\n", sqlite3_errmsg(crawler->db_conn));
+        pthread_mutex_unlock(&crawler->db_mutex);
         return -1;
     }
     
@@ -908,39 +1119,49 @@ int db_insert_page(Crawler *crawler, const URL *url, long status_code,
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         fprintf(stderr, "[!] DB insert failed: %s\n", sqlite3_errmsg(crawler->db_conn));
         sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&crawler->db_mutex);
         return -1;
     }
     
-    sqlite3_int64 id = sqlite3_last_insert_rowid(crawler->db_conn);
-    sqlite3_finalize(stmt);
+    if (page_id)
+        *page_id = sqlite3_last_insert_rowid(crawler->db_conn);
     
-    return (int)id;
+    sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&crawler->db_mutex);
+    
+    return 0;
 }
 
-/* Insert URL parameter into database */
+/* Insert URL parameter into database with category */
 int db_insert_param(Crawler *crawler, sqlite3_int64 page_id, const URLParam *param) {
     if (!crawler->db_conn)
         return -1;
     
     sqlite3_stmt *stmt;
-    const char *sql = "INSERT INTO url_params (page_id, param_name, param_value) VALUES (?, ?, ?)";
+    const char *sql = "INSERT INTO url_params (page_id, param_name, param_value, param_category) VALUES (?, ?, ?, ?)";
+    
+    pthread_mutex_lock(&crawler->db_mutex);
     
     if (sqlite3_prepare_v2(crawler->db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
         fprintf(stderr, "[!] Param prepare failed: %s\n", sqlite3_errmsg(crawler->db_conn));
+        pthread_mutex_unlock(&crawler->db_mutex);
         return -1;
     }
     
     sqlite3_bind_int64(stmt, 1, page_id);
     sqlite3_bind_text(stmt, 2, param->name, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 3, param->value, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, param_category_name(param->category), -1, SQLITE_STATIC);
     
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         fprintf(stderr, "[!] Param insert failed: %s\n", sqlite3_errmsg(crawler->db_conn));
         sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&crawler->db_mutex);
         return -1;
     }
     
     sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&crawler->db_mutex);
     return 0;
 }
 
@@ -1069,10 +1290,13 @@ void process_url(Crawler *crawler, const URL *url) {
     }
     
     /* Record in database for relevant status codes */
-    int page_id = -1;
+    sqlite3_int64 page_id = -1;
     if (status_code == 200 || status_code == 403 || status_code == 500) {
-        page_id = db_insert_page(crawler, url, status_code, content_length, content_type);
+        db_insert_page(crawler, url, status_code, content_length, content_type, &page_id);
         crawler->total_pages++;
+        
+        /* Export to plain text file */
+        export_url_to_file(crawler, url, status_code, content_length);
     }
     
     /* Only parse HTML responses */
@@ -1103,8 +1327,14 @@ void process_url(Crawler *crawler, const URL *url) {
             int param_count = extract_parameters(url->query, params, MAX_PARAMS_PER_URL);
             
             for (int i = 0; i < param_count && page_id > 0; i++) {
+                /* Categorize the parameter */
+                params[i].category = categorize_parameter(params[i].name);
+                
                 db_insert_param(crawler, page_id, &params[i]);
                 crawler->total_params++;
+                
+                /* Export to plain text file */
+                export_param_to_file(crawler, &params[i], url->full_url);
             }
         }
         
@@ -1115,6 +1345,9 @@ void process_url(Crawler *crawler, const URL *url) {
         for (int i = 0; i < asset_count && page_id > 0; i++) {
             db_insert_asset(crawler, page_id, &assets[i]);
             crawler->total_assets++;
+            
+            /* Export to plain text file */
+            export_asset_to_file(crawler, &assets[i], url->full_url);
         }
     }
     
