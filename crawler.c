@@ -1061,6 +1061,7 @@ void db_create_tables(sqlite3 *conn) {
         "  status_code INTEGER,"
         "  content_length INTEGER,"
         "  content_type TEXT,"
+        "  file_type TEXT,"
         "  crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP"
         ")",
         
@@ -1082,10 +1083,31 @@ void db_create_tables(sqlite3 *conn) {
         ")"
     };
     
+    /* Create indexes */
+    const char *indexes[] = {
+        "CREATE INDEX IF NOT EXISTS idx_host ON pages(host)",
+        "CREATE INDEX IF NOT EXISTS idx_status ON pages(status_code)",
+        "CREATE INDEX IF NOT EXISTS idx_crawled_at ON pages(crawled_at)",
+        "CREATE INDEX IF NOT EXISTS idx_file_type ON pages(file_type)",
+        "CREATE INDEX IF NOT EXISTS idx_page ON url_params(page_id)",
+        "CREATE INDEX IF NOT EXISTS idx_param_name ON url_params(param_name)",
+        "CREATE INDEX IF NOT EXISTS idx_param_category ON url_params(param_category)",
+        "CREATE INDEX IF NOT EXISTS idx_asset_page ON assets(page_id)"
+    };
+    
     char *err_msg = NULL;
     for (int i = 0; i < 3; i++) {
         if (sqlite3_exec(conn, queries[i], NULL, NULL, &err_msg) != SQLITE_OK) {
             fprintf(stderr, "[!] Table creation failed: %s\n", err_msg);
+            sqlite3_free(err_msg);
+            err_msg = NULL;
+        }
+    }
+    
+    /* Create indexes */
+    for (int i = 0; i < 8; i++) {
+        if (sqlite3_exec(conn, indexes[i], NULL, NULL, &err_msg) != SQLITE_OK) {
+            fprintf(stderr, "[!] Index creation failed: %s\n", err_msg);
             sqlite3_free(err_msg);
             err_msg = NULL;
         }
@@ -1102,8 +1124,12 @@ int db_insert_page(Crawler *crawler, const URL *url, long status_code,
     char full_url[MAX_URL_LENGTH];
     build_url(url, full_url);
     
-    const char *sql = "INSERT INTO pages (host, path, query, full_url, status_code, content_length, content_type) "
-                      "VALUES (?, ?, ?, ?, ?, ?, ?)";
+    /* Determine file type/extension from path */
+    const char *ext = strrchr(url->path, '.');
+    const char *file_type = ext ? ext + 1 : "html";
+    
+    const char *sql = "INSERT INTO pages (host, path, query, full_url, status_code, content_length, content_type, file_type) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     
     pthread_mutex_lock(&crawler->db_mutex);
     
@@ -1120,6 +1146,7 @@ int db_insert_page(Crawler *crawler, const URL *url, long status_code,
     sqlite3_bind_int(stmt, 5, (int)status_code);
     sqlite3_bind_int64(stmt, 6, (sqlite3_int64)content_length);
     sqlite3_bind_text(stmt, 7, content_type ? content_type : NULL, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 8, file_type, -1, SQLITE_STATIC);
     
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         fprintf(stderr, "[!] DB insert failed: %s\n", sqlite3_errmsg(crawler->db_conn));
@@ -1197,6 +1224,90 @@ int db_insert_asset(Crawler *crawler, sqlite3_int64 page_id, const Asset *asset)
     return 0;
 }
 
+/* ===================== FILE I/O FUNCTIONS ===================== */
+
+/* Initialize output files for plain text export */
+int init_output_files(Crawler *crawler) {
+    /* Create output directory if it doesn't exist */
+    mkdir(OUTPUT_DIR, 0755);
+    
+    char urls_path[512], params_path[512], assets_path[512];
+    snprintf(urls_path, sizeof(urls_path), "%s/urls.txt", OUTPUT_DIR);
+    snprintf(params_path, sizeof(params_path), "%s/parameters.txt", OUTPUT_DIR);
+    snprintf(assets_path, sizeof(assets_path), "%s/assets.txt", OUTPUT_DIR);
+    
+    crawler->urls_file = fopen(urls_path, "a");
+    crawler->params_file = fopen(params_path, "a");
+    crawler->assets_file = fopen(assets_path, "a");
+    
+    if (!crawler->urls_file || !crawler->params_file || !crawler->assets_file) {
+        fprintf(stderr, "[!] Warning: Failed to open output files\n");
+        return -1;
+    }
+    
+    return 0;
+}
+
+/* Close all output files */
+void close_output_files(Crawler *crawler) {
+    if (crawler->urls_file) {
+        fclose(crawler->urls_file);
+        crawler->urls_file = NULL;
+    }
+    if (crawler->params_file) {
+        fclose(crawler->params_file);
+        crawler->params_file = NULL;
+    }
+    if (crawler->assets_file) {
+        fclose(crawler->assets_file);
+        crawler->assets_file = NULL;
+    }
+}
+
+/* Export URL record to file */
+void export_url_to_file(Crawler *crawler, const URL *url, long status_code, long content_length) {
+    if (!crawler->urls_file) return;
+    
+    pthread_mutex_lock(&crawler->output_mutex);
+    
+    char full_url[MAX_URL_LENGTH];
+    build_url(url, full_url);
+    
+    /* Determine file type from path */
+    const char *ext = strrchr(url->path, '.');
+    const char *file_type = ext ? ext + 1 : "unknown";
+    
+    fprintf(crawler->urls_file, "%s | Status: %ld | Size: %ld | Type: %s | Host: %s\n",
+            full_url, status_code, content_length, file_type, url->host);
+    
+    pthread_mutex_unlock(&crawler->output_mutex);
+}
+
+/* Export parameter record to file */
+void export_param_to_file(Crawler *crawler, const URLParam *param, const char *full_url) {
+    if (!crawler->params_file) return;
+    
+    pthread_mutex_lock(&crawler->output_mutex);
+    
+    const char *category = param_category_name(param->category);
+    fprintf(crawler->params_file, "URL: %s | Param: %s = %s | Category: %s\n",
+            full_url, param->name, param->value, category);
+    
+    pthread_mutex_unlock(&crawler->output_mutex);
+}
+
+/* Export asset record to file */
+void export_asset_to_file(Crawler *crawler, const Asset *asset, const char *source_url) {
+    if (!crawler->assets_file) return;
+    
+    pthread_mutex_lock(&crawler->output_mutex);
+    
+    fprintf(crawler->assets_file, "Source: %s | Asset: %s | Type: %s\n",
+            source_url, asset->url, asset->type);
+    
+    pthread_mutex_unlock(&crawler->output_mutex);
+}
+
 /* Initialize crawler */
 void crawler_init(Crawler *crawler, const char *target) {
     memset(crawler, 0, sizeof(Crawler));
@@ -1214,6 +1325,11 @@ void crawler_init(Crawler *crawler, const char *target) {
     /* Connect to database */
     if (db_connect(crawler) != 0) {
         fprintf(stderr, "[!] Warning: Database connection failed, running without storage\n");
+    }
+    
+    /* Initialize output files for plain text export */
+    if (init_output_files(crawler) != 0) {
+        fprintf(stderr, "[!] Warning: Output file initialization failed\n");
     }
     
     strncpy(crawler->target_host, target, sizeof(crawler->target_host) - 1);
