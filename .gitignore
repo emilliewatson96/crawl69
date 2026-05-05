@@ -1,13 +1,5 @@
 ```
-# Backup files
-*.backup
-
-# Executables
-crawler
-
-# Database files
-*.db
-
-# Output directories
-output/
+*.o
+*.obj
+*.out
 ```
