@@ -1,75 +1,20 @@
-# Makefile for C-Based Web Crawler
-# 
-# Prerequisites:
-#   - libcurl development files (libcurl-dev or libcurl-devel)
-#   - libxml2 development files (libxml2-dev or libxml2-devel)
-#   - SQLite3 development files (libsqlite3-dev or sqlite3-devel)
-#
-# Install on Debian/Ubuntu:
-#   sudo apt-get install libcurl4-openssl-dev libxml2-dev libsqlite3-dev
-#
-# Install on RHEL/CentOS/Fedora:
-#   sudo dnf install libcurl-devel libxml2-devel sqlite3-devel
-#
-# Install on Alpine:
-#   apk add curl-dev libxml2-dev sqlite-dev
-
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -I/usr/include/libxml2
-LDFLAGS = -lcurl -lxml2 -lsqlite3 -lz -lssl -lcrypto
+CFLAGS = -Wall -Wextra -O2 -std=c11 -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE -I/usr/include/libxml2
+LDFLAGS = -lcurl -lxml2 -lsqlite3 -lpthread -lm
 
-# For static linking (single portable binary)
-STATIC_LDFLAGS = -static $(LDFLAGS)
-
-# Targets
 TARGET = crawler
-TARGET_STATIC = crawler-static
-
 SRCS = crawler.c
-OBJS = $(SRCS:.c=.o)
-
-.PHONY: all clean static install uninstall test
 
 all: $(TARGET)
 
-# Default build (dynamic linking)
 $(TARGET): $(SRCS)
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS) $(LDFLAGS)
 
-# Static build (portable single binary)
-static: $(TARGET_STATIC)
+static: $(SRCS)
+	$(CC) $(CFLAGS) -static -o $(TARGET) $(SRCS) $(LDFLAGS)
 
-$(TARGET_STATIC): $(SRCS)
-	$(CC) $(CFLAGS) -o $@ $< $(STATIC_LDFLAGS)
-
-# Object file compilation
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-# Clean build artifacts
 clean:
-	rm -f $(TARGET) $(TARGET_STATIC) $(OBJS)
+	rm -f $(TARGET) *.db
+	rm -rf output/
 
-# Install to /usr/local/bin
-install: $(TARGET)
-	install -m 755 $(TARGET) /usr/local/bin/
-
-# Uninstall from /usr/local/bin
-uninstall:
-	rm -f /usr/local/bin/$(TARGET)
-
-# Simple test (requires a local web server)
-test: $(TARGET)
-	@echo "Testing crawler with localhost..."
-	@./$(TARGET) -d 2 localhost || echo "Test skipped (no local server)"
-
-# Show help
-help:
-	@echo "Available targets:"
-	@echo "  all      - Build dynamic binary (default)"
-	@echo "  static   - Build static binary (portable)"
-	@echo "  clean    - Remove build artifacts"
-	@echo "  install  - Install to /usr/local/bin"
-	@echo "  uninstall- Remove from /usr/local/bin"
-	@echo "  test     - Run basic test"
-	@echo "  help     - Show this help"
+.PHONY: all static clean

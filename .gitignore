@@ -1,13 +1,1 @@
-```
-# Database
-crawler.db
-
-# Compiled files
-*.o
-*.obj
-*.out
-
-# Logs and temp files
-*.log
-*.tmp
-```
+Nothing should be ignored based on the provided file changes. The changes only include source/config files (Makefile, README.md) with no build artifacts, dependencies, or temporary files that need to be ignored.
