@@ -55,8 +55,10 @@
 #define REQUEST_DELAY_MS 50
 #define MAX_DEPTH 10
 #define MAX_LINKS_PER_PAGE 1000
-#define MAX_CONCURRENT_REQUESTS 20
+#define MAX_CONCURRENT_REQUESTS 50
 #define WAYBACK_BATCH_SIZE 1000
+#define MAX_TARGETS 10000
+#define MAX_WAYBACK_URLS 50000
 
 /* Database configuration */
 #define DB_FILE "crawler.db"
@@ -278,6 +280,10 @@ void process_url(Crawler *crawler, const URL *url);
 /* Seed processing */
 int process_seeds(Crawler *crawler, char **seeds, int seed_count);
 int process_seed_file(Crawler *crawler, const char *filename);
+
+/* Wayback Machine integration */
+int fetch_wayback_urls(Crawler *crawler, const char *host);
+int parse_wayback_response(Crawler *crawler, const char *json_response, const char *host);
 
 /* ===================== IMPLEMENTATION ===================== */
 
@@ -1480,6 +1486,12 @@ void process_url(Crawler *crawler, const URL *url) {
 void crawler_run(Crawler *crawler) {
     printf("[+] Starting depth-first crawl...\n");
     
+    /* Fetch Wayback Machine URLs for the target host */
+    if (crawler->target_host[0] != '\0') {
+        printf("[*] Fetching historical URLs from Wayback Machine for %s...\n", crawler->target_host);
+        fetch_wayback_urls(crawler, crawler->target_host);
+    }
+    
     while (!stack_empty(crawler)) {
         URL url;
         if (stack_pop(crawler, &url)) {
@@ -1534,6 +1546,108 @@ void crawler_cleanup(Crawler *crawler) {
     /* Close database connection */
     if (crawler->db_conn)
         sqlite3_close(crawler->db_conn);
+}
+
+/* Fetch URLs from Wayback Machine CDX API */
+int fetch_wayback_urls(Crawler *crawler, const char *host) {
+    if (!host || !*host)
+        return -1;
+    
+    char url[512];
+    snprintf(url, sizeof(url), "http://web.archive.org/cdx/search/cdx?url=*.%s/*&output=json&fl=original&collapse=urlkey&limit=%d", 
+             host, MAX_WAYBACK_URLS);
+    
+    CURL *curl = curl_easy_init();
+    if (!curl)
+        return -1;
+    
+    ResponseBuffer response;
+    response.data = malloc(65536);
+    if (!response.data) {
+        curl_easy_cleanup(curl);
+        return -1;
+    }
+    response.size = 0;
+    response.capacity = 65536;
+    response.data[0] = '\0';
+    
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, get_random_user_agent());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 60L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&response);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Accept: application/json");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    
+    CURLcode res = curl_easy_perform(curl);
+    curl_slist_free_all(headers);
+    
+    if (res == CURLE_OK && response.data) {
+        parse_wayback_response(crawler, response.data, host);
+    }
+    
+    free(response.data);
+    curl_easy_cleanup(curl);
+    
+    return 0;
+}
+
+/* Parse Wayback Machine JSON response and add URLs to crawl queue */
+int parse_wayback_response(Crawler *crawler, const char *json_response, const char *host) {
+    if (!json_response || !*json_response)
+        return -1;
+    
+    int added = 0;
+    const char *p = json_response;
+    
+    /* Skip the header row ["original"] */
+    while (*p && *p != '[') p++;
+    if (*p) p++;
+    while (*p && *p != ']') p++;
+    if (*p) p++;
+    
+    /* Parse each URL line */
+    while (*p) {
+        /* Skip whitespace and commas */
+        while (*p && (*p == ',' || *p == ' ' || *p == '\n' || *p == '\r')) p++;
+        
+        if (*p == '"') {
+            p++; /* Skip opening quote */
+            char url_str[MAX_URL_LENGTH];
+            int i = 0;
+            
+            /* Extract URL until closing quote */
+            while (*p && *p != '"' && i < MAX_URL_LENGTH - 1) {
+                url_str[i++] = *p++;
+            }
+            url_str[i] = '\0';
+            
+            if (*p == '"') p++; /* Skip closing quote */
+            
+            /* Check if URL is from target host and not already visited */
+            if (strstr(url_str, host) && !visited_contains(&crawler->visited, url_str)) {
+                URL url;
+                if (parse_url(url_str, &url) == 0) {
+                    url.depth = 0;
+                    stack_push(crawler, &url);
+                    visited_add(&crawler->visited, url_str);
+                    added++;
+                    
+                    if (added >= MAX_WAYBACK_URLS)
+                        break;
+                }
+            }
+        }
+        
+        if (!*p) break;
+    }
+    
+    printf("[+] Added %d historical URLs from Wayback Machine\n", added);
+    return added;
 }
 
 /* Print usage */
