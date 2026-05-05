@@ -1,0 +1,5 @@
+Source: httpbin.org/ | Asset: /flasgger_static/swagger-ui-bundle.js | Type: script
+Source: httpbin.org/ | Asset: /flasgger_static/swagger-ui-standalone-preset.js | Type: script
+Source: httpbin.org/ | Asset: /flasgger_static/lib/jquery.min.js | Type: script
+Source: httpbin.org/ | Asset: https://fonts.googleapis.com/css?family=Open+Sans:400,700|Source+Code+Pro:300,600|Titillium+Web:400,600,700 | Type: stylesheet
+Source: httpbin.org/ | Asset: /flasgger_static/swagger-ui.css | Type: stylesheet
