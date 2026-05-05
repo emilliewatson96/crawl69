@@ -3,23 +3,23 @@
 # Prerequisites:
 #   - libcurl development files (libcurl-dev or libcurl-devel)
 #   - libxml2 development files (libxml2-dev or libxml2-devel)
-#   - MySQL client development files (libmysqlclient-dev or mysql-devel)
+#   - SQLite3 development files (libsqlite3-dev or sqlite3-devel)
 #
 # Install on Debian/Ubuntu:
-#   sudo apt-get install libcurl4-openssl-dev libxml2-dev libmysqlclient-dev
+#   sudo apt-get install libcurl4-openssl-dev libxml2-dev libsqlite3-dev
 #
 # Install on RHEL/CentOS/Fedora:
-#   sudo dnf install libcurl-devel libxml2-devel mysql-devel
+#   sudo dnf install libcurl-devel libxml2-devel sqlite3-devel
 #
 # Install on Alpine:
-#   apk add curl-dev libxml2-dev mysql-dev
+#   apk add curl-dev libxml2-dev sqlite-dev
 
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -I/usr/include/libxml2
-LDFLAGS = -lcurl -lxml2 -lmysqlclient -lz -lssl -lcrypto
+LDFLAGS = -lcurl -lxml2 -lsqlite3 -lz -lssl -lcrypto
 
 # For static linking (single portable binary)
-STATIC_LDFLAGS = -static $(LDFLAGS) -lpcre
+STATIC_LDFLAGS = -static $(LDFLAGS)
 
 # Targets
 TARGET = crawler

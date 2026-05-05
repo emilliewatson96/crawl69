@@ -13,7 +13,7 @@
  * - External domain filtering (Google, YouTube, etc.)
  * - Static linking for portability
  *
- * Compile: gcc -o crawler crawler.c -static -lcurl -lxml2 -lmysqlclient -lz -lssl -lcrypto -lpcre
+ * Compile: gcc -o crawler crawler.c -lcurl -lxml2 -lsqlite3 -lz -lssl -lcrypto
  */
 
 #include <stdio.h>
@@ -37,8 +37,8 @@
 #include <libxml/xpath.h>
 #include <libxml/xpathInternals.h>
 
-/* MySQL headers */
-#include <mysql/mysql.h>
+/* SQLite3 headers */
+#include <sqlite3.h>
 
 /* ===================== CONFIGURATION ===================== */
 #define MAX_URL_LENGTH 2048
@@ -52,10 +52,7 @@
 #define MAX_LINKS_PER_PAGE 1000
 
 /* Database configuration */
-#define DB_HOST "localhost"
-#define DB_USER "crawler"
-#define DB_PASS "crawler_pass"
-#define DB_NAME "web_crawler"
+#define DB_FILE "crawler.db"
 
 /* Blacklisted domains to ignore */
 const char *BLACKLISTED_DOMAINS[] = {
@@ -128,7 +125,7 @@ typedef struct {
     int stack_size;
     VisitedSet visited;
     CURL *curl;
-    MYSQL *db_conn;
+    sqlite3 *db_conn;
     int total_pages;
     int total_params;
     int total_assets;
@@ -184,9 +181,9 @@ int extract_parameters(const char *query, URLParam *params, int max_params);
 int db_connect(Crawler *crawler);
 int db_insert_page(Crawler *crawler, const URL *url, long status_code, 
                    long content_length, const char *content_type);
-int db_insert_param(Crawler *crawler, int page_id, const URLParam *param);
-int db_insert_asset(Crawler *crawler, int page_id, const Asset *asset);
-void db_create_tables(MYSQL *conn);
+int db_insert_param(Crawler *crawler, sqlite3_int64 page_id, const URLParam *param);
+int db_insert_asset(Crawler *crawler, sqlite3_int64 page_id, const Asset *asset);
+void db_create_tables(sqlite3 *conn);
 
 /* Utility functions */
 char *get_random_user_agent(void);
@@ -826,18 +823,11 @@ int extract_parameters(const char *query, URLParam *params, int max_params) {
     return count;
 }
 
-/* Connect to MySQL database */
+/* Connect to SQLite database */
 int db_connect(Crawler *crawler) {
-    crawler->db_conn = mysql_init(NULL);
-    if (!crawler->db_conn) {
-        fprintf(stderr, "[!] MySQL init failed\n");
-        return -1;
-    }
-    
-    if (!mysql_real_connect(crawler->db_conn, DB_HOST, DB_USER, DB_PASS, 
-                            DB_NAME, 0, NULL, 0)) {
-        fprintf(stderr, "[!] MySQL connect failed: %s\n", mysql_error(crawler->db_conn));
-        mysql_close(crawler->db_conn);
+    int rc = sqlite3_open(DB_FILE, &crawler->db_conn);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[!] SQLite open failed: %s\n", sqlite3_errmsg(crawler->db_conn));
         return -1;
     }
     
@@ -848,45 +838,43 @@ int db_connect(Crawler *crawler) {
 }
 
 /* Create database tables */
-void db_create_tables(MYSQL *conn) {
+void db_create_tables(sqlite3 *conn) {
     const char *queries[] = {
         "CREATE TABLE IF NOT EXISTS pages ("
-        "  id INT AUTO_INCREMENT PRIMARY KEY,"
-        "  host VARCHAR(255) NOT NULL,"
-        "  path VARCHAR(1024) NOT NULL,"
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  host TEXT NOT NULL,"
+        "  path TEXT NOT NULL,"
         "  query TEXT,"
         "  full_url TEXT NOT NULL,"
-        "  status_code INT,"
-        "  content_length BIGINT,"
-        "  content_type VARCHAR(255),"
-        "  crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
-        "  INDEX idx_host (host),"
-        "  INDEX idx_status (status_code)"
+        "  status_code INTEGER,"
+        "  content_length INTEGER,"
+        "  content_type TEXT,"
+        "  crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP"
         ")",
         
         "CREATE TABLE IF NOT EXISTS url_params ("
-        "  id INT AUTO_INCREMENT PRIMARY KEY,"
-        "  page_id INT NOT NULL,"
-        "  param_name VARCHAR(255) NOT NULL,"
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  page_id INTEGER NOT NULL,"
+        "  param_name TEXT NOT NULL,"
         "  param_value TEXT,"
-        "  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE,"
-        "  INDEX idx_page (page_id),"
-        "  INDEX idx_param_name (param_name)"
+        "  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE"
         ")",
         
         "CREATE TABLE IF NOT EXISTS assets ("
-        "  id INT AUTO_INCREMENT PRIMARY KEY,"
-        "  page_id INT NOT NULL,"
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  page_id INTEGER NOT NULL,"
         "  asset_url TEXT NOT NULL,"
-        "  asset_type VARCHAR(64),"
-        "  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE,"
-        "  INDEX idx_page (page_id)"
+        "  asset_type TEXT,"
+        "  FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE"
         ")"
     };
     
+    char *err_msg = NULL;
     for (int i = 0; i < 3; i++) {
-        if (mysql_query(conn, queries[i])) {
-            fprintf(stderr, "[!] Table creation failed: %s\n", mysql_error(conn));
+        if (sqlite3_exec(conn, queries[i], NULL, NULL, &err_msg) != SQLITE_OK) {
+            fprintf(stderr, "[!] Table creation failed: %s\n", err_msg);
+            sqlite3_free(err_msg);
+            err_msg = NULL;
         }
     }
 }
@@ -897,82 +885,89 @@ int db_insert_page(Crawler *crawler, const URL *url, long status_code,
     if (!crawler->db_conn)
         return -1;
     
-    char query[4096];
-    char escaped_host[512], escaped_path[2048], escaped_query[2048], 
-         escaped_url[4096], escaped_type[512];
-    
-    mysql_real_escape_string(crawler->db_conn, escaped_host, url->host, strlen(url->host));
-    mysql_real_escape_string(crawler->db_conn, escaped_path, url->path, strlen(url->path));
-    mysql_real_escape_string(crawler->db_conn, escaped_query, url->query, strlen(url->query));
-    
+    sqlite3_stmt *stmt;
     char full_url[MAX_URL_LENGTH];
     build_url(url, full_url);
-    mysql_real_escape_string(crawler->db_conn, escaped_url, full_url, strlen(full_url));
     
-    if (content_type)
-        mysql_real_escape_string(crawler->db_conn, escaped_type, content_type, strlen(content_type));
-    else
-        escaped_type[0] = '\0';
+    const char *sql = "INSERT INTO pages (host, path, query, full_url, status_code, content_length, content_type) "
+                      "VALUES (?, ?, ?, ?, ?, ?, ?)";
     
-    snprintf(query, sizeof(query),
-             "INSERT INTO pages (host, path, query, full_url, status_code, content_length, content_type) "
-             "VALUES ('%s', '%s', '%s', '%s', %ld, %ld, '%s')",
-             escaped_host, escaped_path, escaped_query, escaped_url,
-             status_code, content_length, escaped_type);
-    
-    if (mysql_query(crawler->db_conn, query)) {
-        fprintf(stderr, "[!] DB insert failed: %s\n", mysql_error(crawler->db_conn));
+    if (sqlite3_prepare_v2(crawler->db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[!] DB prepare failed: %s\n", sqlite3_errmsg(crawler->db_conn));
         return -1;
     }
     
-    return (int)mysql_insert_id(crawler->db_conn);
+    sqlite3_bind_text(stmt, 1, url->host, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, url->path, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, url->query[0] ? url->query : NULL, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, full_url, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 5, (int)status_code);
+    sqlite3_bind_int64(stmt, 6, (sqlite3_int64)content_length);
+    sqlite3_bind_text(stmt, 7, content_type ? content_type : NULL, -1, SQLITE_STATIC);
+    
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        fprintf(stderr, "[!] DB insert failed: %s\n", sqlite3_errmsg(crawler->db_conn));
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    
+    sqlite3_int64 id = sqlite3_last_insert_rowid(crawler->db_conn);
+    sqlite3_finalize(stmt);
+    
+    return (int)id;
 }
 
 /* Insert URL parameter into database */
-int db_insert_param(Crawler *crawler, int page_id, const URLParam *param) {
+int db_insert_param(Crawler *crawler, sqlite3_int64 page_id, const URLParam *param) {
     if (!crawler->db_conn)
         return -1;
     
-    char query[1536];
-    char escaped_name[512], escaped_value[1024];
+    sqlite3_stmt *stmt;
+    const char *sql = "INSERT INTO url_params (page_id, param_name, param_value) VALUES (?, ?, ?)";
     
-    mysql_real_escape_string(crawler->db_conn, escaped_name, param->name, strlen(param->name));
-    mysql_real_escape_string(crawler->db_conn, escaped_value, param->value, strlen(param->value));
-    
-    snprintf(query, sizeof(query),
-             "INSERT INTO url_params (page_id, param_name, param_value) "
-             "VALUES (%d, '%s', '%s')",
-             page_id, escaped_name, escaped_value);
-    
-    if (mysql_query(crawler->db_conn, query)) {
-        fprintf(stderr, "[!] Param insert failed: %s\n", mysql_error(crawler->db_conn));
+    if (sqlite3_prepare_v2(crawler->db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[!] Param prepare failed: %s\n", sqlite3_errmsg(crawler->db_conn));
         return -1;
     }
     
+    sqlite3_bind_int64(stmt, 1, page_id);
+    sqlite3_bind_text(stmt, 2, param->name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, param->value, -1, SQLITE_STATIC);
+    
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        fprintf(stderr, "[!] Param insert failed: %s\n", sqlite3_errmsg(crawler->db_conn));
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    
+    sqlite3_finalize(stmt);
     return 0;
 }
 
 /* Insert asset into database */
-int db_insert_asset(Crawler *crawler, int page_id, const Asset *asset) {
+int db_insert_asset(Crawler *crawler, sqlite3_int64 page_id, const Asset *asset) {
     if (!crawler->db_conn)
         return -1;
     
-    char query[3072];
-    char escaped_url[2048], escaped_type[128];
+    sqlite3_stmt *stmt;
+    const char *sql = "INSERT INTO assets (page_id, asset_url, asset_type) VALUES (?, ?, ?)";
     
-    mysql_real_escape_string(crawler->db_conn, escaped_url, asset->url, strlen(asset->url));
-    mysql_real_escape_string(crawler->db_conn, escaped_type, asset->type, strlen(asset->type));
-    
-    snprintf(query, sizeof(query),
-             "INSERT INTO assets (page_id, asset_url, asset_type) "
-             "VALUES (%d, '%s', '%s')",
-             page_id, escaped_url, escaped_type);
-    
-    if (mysql_query(crawler->db_conn, query)) {
-        fprintf(stderr, "[!] Asset insert failed: %s\n", mysql_error(crawler->db_conn));
+    if (sqlite3_prepare_v2(crawler->db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[!] Asset prepare failed: %s\n", sqlite3_errmsg(crawler->db_conn));
         return -1;
     }
     
+    sqlite3_bind_int64(stmt, 1, page_id);
+    sqlite3_bind_text(stmt, 2, asset->url, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, asset->type, -1, SQLITE_STATIC);
+    
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        fprintf(stderr, "[!] Asset insert failed: %s\n", sqlite3_errmsg(crawler->db_conn));
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+    
+    sqlite3_finalize(stmt);
     return 0;
 }
 
@@ -1181,7 +1176,7 @@ void crawler_cleanup(Crawler *crawler) {
     
     /* Close database connection */
     if (crawler->db_conn)
-        mysql_close(crawler->db_conn);
+        sqlite3_close(crawler->db_conn);
 }
 
 /* Print usage */
