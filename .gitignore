@@ -1,4 +1,13 @@
-```c
-crawler.c
-test_targets.txt
+```
+# Backup files
+*.backup
+
+# Executables
+crawler
+
+# Database files
+*.db
+
+# Output directories
+output/
 ```
