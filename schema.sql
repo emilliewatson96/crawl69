@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS pages (
     status_code INTEGER,             -- HTTP response status code
     content_length INTEGER,          -- Response body size in bytes
     content_type TEXT,               -- Content-Type header
+    file_type TEXT,                  -- File type/extension (html, php, js, etc.)
     crawled_at DATETIME DEFAULT CURRENT_TIMESTAMP  -- When the page was crawled
 );
 
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS pages (
 CREATE INDEX IF NOT EXISTS idx_host ON pages(host);
 CREATE INDEX IF NOT EXISTS idx_status ON pages(status_code);
 CREATE INDEX IF NOT EXISTS idx_crawled_at ON pages(crawled_at);
+CREATE INDEX IF NOT EXISTS idx_file_type ON pages(file_type);
 
 -- Table: url_params
 -- Stores individual URL parameters extracted from pages
@@ -28,6 +30,7 @@ CREATE TABLE IF NOT EXISTS url_params (
     page_id INTEGER NOT NULL,        -- Foreign key to pages table
     param_name TEXT NOT NULL,        -- Parameter name
     param_value TEXT,                -- Parameter value (URL decoded)
+    param_category TEXT,             -- Parameter category: SENSITIVE, NAVIGATION, SEARCH, STANDARD
     
     FOREIGN KEY (page_id) REFERENCES pages(id) ON DELETE CASCADE
 );
@@ -35,6 +38,7 @@ CREATE TABLE IF NOT EXISTS url_params (
 -- Create indexes for faster queries
 CREATE INDEX IF NOT EXISTS idx_page ON url_params(page_id);
 CREATE INDEX IF NOT EXISTS idx_param_name ON url_params(param_name);
+CREATE INDEX IF NOT EXISTS idx_param_category ON url_params(param_category);
 
 -- Table: assets
 -- Stores assets (images, scripts, stylesheets) found on pages
@@ -62,16 +66,27 @@ FROM pages
 GROUP BY status_code
 ORDER BY count DESC;
 
--- View: Top parameter names found across all pages
+-- View: Top parameter names found across all pages with categories
 CREATE VIEW IF NOT EXISTS v_top_params AS
 SELECT 
     param_name,
+    param_category,
     COUNT(*) as occurrence_count,
     COUNT(DISTINCT page_id) as page_count
 FROM url_params
-GROUP BY param_name
+GROUP BY param_name, param_category
 ORDER BY occurrence_count DESC
 LIMIT 50;
+
+-- View: Parameters by category
+CREATE VIEW IF NOT EXISTS v_params_by_category AS
+SELECT 
+    param_category,
+    COUNT(*) as count,
+    GROUP_CONCAT(DISTINCT param_name) as param_names
+FROM url_params
+GROUP BY param_category
+ORDER BY count DESC;
 
 -- View: Pages with most parameters
 CREATE VIEW IF NOT EXISTS v_pages_with_params AS
@@ -81,6 +96,7 @@ SELECT
     p.path,
     p.full_url,
     p.status_code,
+    p.file_type,
     COUNT(up.id) as param_count
 FROM pages p
 LEFT JOIN url_params up ON p.id = up.page_id
@@ -97,3 +113,14 @@ FROM assets
 WHERE asset_type IS NOT NULL AND asset_type != ''
 GROUP BY asset_type
 ORDER BY count DESC;
+
+-- View: Sensitive parameters (security audit)
+CREATE VIEW IF NOT EXISTS v_sensitive_params AS
+SELECT 
+    p.full_url,
+    up.param_name,
+    up.param_value
+FROM url_params up
+JOIN pages p ON up.page_id = p.id
+WHERE up.param_category = 'SENSITIVE'
+ORDER BY p.crawled_at DESC;
