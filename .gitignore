@@ -1,5 +1,1 @@
-```
-*.o
-*.obj
-*.out
-```
+Nothing should be ignored in this case. The changes consist only of source code files (.c files) and an executable binary (crawler), which are core project files that should be tracked in version control. No build artifacts, dependencies, or temporary files are present in the change list that would warrant adding ignore rules.
