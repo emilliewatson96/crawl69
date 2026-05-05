@@ -30,6 +30,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <sys/stat.h>
 #include <pthread.h>
 
 /* libcurl headers */
@@ -189,6 +190,7 @@ typedef struct Crawler {
     int max_depth;
     int verbose;
     int use_colors;
+    int use_wayback;
     pthread_mutex_t db_mutex;
     pthread_mutex_t output_mutex;
     FILE *urls_file;
@@ -1652,20 +1654,30 @@ int parse_wayback_response(Crawler *crawler, const char *json_response, const ch
 
 /* Print usage */
 void print_usage(const char *prog) {
-    printf("Usage: %s [options] <seed1> [seed2] ...\n\n", prog);
-    printf("Seeds can be:\n");
-    printf("  - Domain: example.com\n");
-    printf("  - Subdomain: api.example.com\n");
-    printf("  - IP address: 192.168.1.1\n");
-    printf("  - CIDR range: 192.168.1.0/24\n\n");
-    printf("Options:\n");
-    printf("  -d <depth>    Maximum crawl depth (default: %d)\n", MAX_DEPTH);
-    printf("  -q            Quiet mode (less output)\n");
-    printf("  -h            Show this help\n\n");
-    printf("Examples:\n");
+    printf(COLOR_BOLD COLOR_CYAN "\n╔═══════════════════════════════════════════════════════════╗\n" COLOR_RESET);
+    printf(COLOR_BOLD COLOR_CYAN "║              Advanced Web Crawler - Usage Guide              ║\n" COLOR_RESET);
+    printf(COLOR_BOLD COLOR_CYAN "╚═══════════════════════════════════════════════════════════╝\n\n" COLOR_RESET);
+    printf("Usage: %s [options] <seed1> [seed2] ... | -f <targets_file>\n\n", prog);
+    printf(COLOR_BOLD "Seeds can be:" COLOR_RESET "\n");
+    printf("  • Domain:        example.com\n");
+    printf("  • Subdomain:     api.example.com\n");
+    printf("  • IP address:    192.168.1.1\n");
+    printf("  • CIDR range:    192.168.1.0/24\n");
+    printf("  • Full URL:      https://example.com/path\n\n");
+    printf(COLOR_BOLD "Options:" COLOR_RESET "\n");
+    printf("  " COLOR_GREEN "-f <file>" COLOR_RESET "      Read targets from file (one per line)\n");
+    printf("  " COLOR_GREEN "-d <depth>" COLOR_RESET "     Maximum crawl depth (default: %d)\n", MAX_DEPTH);
+    printf("  " COLOR_GREEN "-t <threads>" COLOR_RESET "   Max concurrent requests (default: %d)\n", MAX_CONCURRENT_REQUESTS);
+    printf("  " COLOR_GREEN "-q" COLOR_RESET "             Quiet mode (minimal output)\n");
+    printf("  " COLOR_GREEN "-v" COLOR_RESET "             Verbose mode (detailed output)\n");
+    printf("  " COLOR_GREEN "-w" COLOR_RESET "             Enable Wayback Machine lookup\n");
+    printf("  " COLOR_GREEN "-h" COLOR_RESET "             Show this help message\n\n");
+    printf(COLOR_BOLD "Examples:" COLOR_RESET "\n");
     printf("  %s example.com\n", prog);
-    printf("  %s -d 5 example.com api.example.com\n", prog);
-    printf("  %s 192.168.1.0/24\n", prog);
+    printf("  %s -d 5 -t 30 example.com api.example.com\n", prog);
+    printf("  %s -f targets.txt\n", prog);
+    printf("  %s -w -d 3 example.com\n", prog);
+    printf("  %s 192.168.1.0/24\n\n", prog);
 }
 
 /* Main entry point */
@@ -1676,10 +1688,13 @@ int main(int argc, char *argv[]) {
     }
     
     /* Parse command line arguments */
-    char **seeds = malloc(argc * sizeof(char *));
+    char **seeds = malloc(MAX_TARGETS * sizeof(char *));
     int seed_count = 0;
     int max_depth = MAX_DEPTH;
     int verbose = 1;
+    int use_wayback = 0;
+    int max_threads = MAX_CONCURRENT_REQUESTS;
+    char *targets_file = NULL;
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1687,11 +1702,43 @@ int main(int argc, char *argv[]) {
             return 0;
         } else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) {
             max_depth = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
+            max_threads = atoi(argv[++i]);
+            if (max_threads < 1) max_threads = 1;
+            if (max_threads > MAX_CONCURRENT_REQUESTS) max_threads = MAX_CONCURRENT_REQUESTS;
         } else if (strcmp(argv[i], "-q") == 0) {
             verbose = 0;
+        } else if (strcmp(argv[i], "-v") == 0) {
+            verbose = 2;
+        } else if (strcmp(argv[i], "-w") == 0) {
+            use_wayback = 1;
+        } else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
+            targets_file = argv[++i];
         } else if (argv[i][0] != '-') {
             seeds[seed_count++] = argv[i];
         }
+    }
+    
+    /* Read from file if specified */
+    if (targets_file) {
+        FILE *f = fopen(targets_file, "r");
+        if (!f) {
+            fprintf(stderr, "[!] Error: Cannot open targets file '%s'\n", targets_file);
+            free(seeds);
+            return 1;
+        }
+        char line[MAX_URL_LENGTH];
+        while (fgets(line, sizeof(line), f) && seed_count < MAX_TARGETS) {
+            /* Trim whitespace and skip comments/empty lines */
+            char *p = line;
+            while (*p && isspace(*p)) p++;
+            if (*p == '\0' || *p == '#') continue;
+            char *end = p + strlen(p) - 1;
+            while (end > p && isspace(*end)) *end-- = '\0';
+            seeds[seed_count++] = strdup(p);
+        }
+        fclose(f);
+        printf(COLOR_GREEN "[+] Loaded %d targets from file: %s\n" COLOR_RESET, seed_count, targets_file);
     }
     
     if (seed_count == 0) {
@@ -1716,9 +1763,16 @@ int main(int argc, char *argv[]) {
     crawler_init(&crawler, "");
     crawler.max_depth = max_depth;
     crawler.verbose = verbose;
+    crawler.use_wayback = use_wayback;
     
     /* Process seeds */
     process_seeds(&crawler, seeds, seed_count);
+    
+    /* Fetch Wayback Machine URLs if enabled */
+    if (use_wayback && crawler.target_host[0]) {
+        print_info("Fetching historical URLs from Wayback Machine...");
+        fetch_wayback_urls(&crawler, crawler.target_host);
+    }
     
     /* Run crawler */
     crawler_run(&crawler);
@@ -1727,6 +1781,11 @@ int main(int argc, char *argv[]) {
     crawler_cleanup(&crawler);
     xmlCleanupParser();
     curl_global_cleanup();
+    
+    /* Free seeds (including strdup'd ones from file) */
+    for (int i = 0; i < seed_count; i++) {
+        if (targets_file) free(seeds[i]);
+    }
     free(seeds);
     
     return 0;

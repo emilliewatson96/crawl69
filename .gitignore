@@ -1,1 +1,10 @@
-Nothing should be ignored based on the provided file changes. The changes consist only of source/config files (.txt and .c), which should not be added to .gitignore according to the rules.
+```
+# Database files
+*.db
+
+# Output directories
+output/
+
+# Executable
+crawler
+```
