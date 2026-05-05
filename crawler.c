@@ -148,6 +148,16 @@ typedef struct {
     int count;
 } VisitedSet;
 
+/* Response buffer for libcurl */
+typedef struct {
+    char *data;
+    size_t size;
+    size_t capacity;
+} ResponseBuffer;
+
+/* Forward declaration */
+struct Crawler;
+
 /* Async request context for multi interface */
 typedef struct {
     CURL *easy;
@@ -157,15 +167,16 @@ typedef struct {
     long content_length;
     char *content_type;
     sqlite3_int64 page_id;
-    Crawler *crawler;
+    struct Crawler *crawler;
 } AsyncRequest;
 
 /* Crawler state */
-typedef struct {
+typedef struct Crawler {
     StackNode *stack;
     int stack_size;
     VisitedSet visited;
     CURLM *multi;  /* Multi handle for async requests */
+    CURL *curl;    /* Easy handle for HTTP requests */
     sqlite3 *db_conn;
     int total_pages;
     int total_params;
@@ -182,13 +193,6 @@ typedef struct {
     FILE *params_file;
     FILE *assets_file;
 } Crawler;
-
-/* Response buffer for libcurl */
-typedef struct {
-    char *data;
-    size_t size;
-    size_t capacity;
-} ResponseBuffer;
 
 /* ===================== FUNCTION PROTOTYPES ===================== */
 

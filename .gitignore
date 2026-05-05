@@ -1,88 +1,44 @@
 ```
-# Compiled and build artifacts
+# Compiled files
 *.o
 *.obj
 *.out
-*.exe
-*.dll
-*.so
-*.a
 
 # Dependencies
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
+node_modules/
 venv/
 .venv/
-.conda/
-
-# Logs and temp files
-*.log
-*.tmp
-*.swp
-*.swo
-*.bak
-*.~*
-
-# Environment
-.env
-.env.local
-.env.*
-.envrc
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+dist/
+build/
+target/
+.gradle/
 
 # Editors
 .vscode/
 .idea/
-*.sublime-project
-*.sublime-workspace
-nbproject/
-.settings/
+*.swp
+*.swo
 
-# OS generated files
+# System files
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
-desktop.ini
+.env
+.env.local
+*.env.*
 
-# Build outputs
-dist/
-build/
-target/
-release/
-debug/
-bin/
-obj/
+# Logs and temp files
+*.log
+*.tmp
 
-# Package management
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-package-lock.json
-yarn.lock
-
-# Testing
-.coverage
+# Coverage
 coverage/
 htmlcov/
-.nyc_output/
-.mypy_cache/
-.pytest_cache/
-.hypothesis/
+.coverage
 
-# Database
-*.sqlite
-*.db
-*.db-journal
-
-# Compression
+# Compressed files
 *.zip
 *.gz
 *.tar
